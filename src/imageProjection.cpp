@@ -1,5 +1,6 @@
 #include "utility.hpp"
 #include "lio_sam/msg/cloud_info.hpp"
+#include <livox_ros_driver2/msg/custom_msg.hpp>
 
 struct VelodynePointXYZIRT
 {
@@ -43,6 +44,8 @@ private:
     std::mutex odoLock;
 
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr subLaserCloud;
+    rclcpp::Subscription<livox_ros_driver2::msg::CustomMsg>::SharedPtr subLaserCloudLivox;
+
     rclcpp::CallbackGroup::SharedPtr callbackGroupLidar;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloud;
 
@@ -59,6 +62,9 @@ private:
 
     std::deque<sensor_msgs::msg::PointCloud2> cloudQueue;
     sensor_msgs::msg::PointCloud2 currentCloudMsg;
+
+    std::deque<livox_ros_driver2::msg::CustomMsg> cloudQueueLivox;
+    livox_ros_driver2::msg::CustomMsg currentCloudMsgLivox;
 
     double *imuTime = new double[queueLength];
     double *imuRotX = new double[queueLength];
@@ -117,10 +123,21 @@ public:
             odomTopic + "_incremental", qos_imu,
             std::bind(&ImageProjection::odometryHandler, this, std::placeholders::_1),
             odomOpt);
-        subLaserCloud = create_subscription<sensor_msgs::msg::PointCloud2>(
-            pointCloudTopic, qos_lidar,
-            std::bind(&ImageProjection::cloudHandler, this, std::placeholders::_1),
-            lidarOpt);
+
+        if (sensor == SensorType::LIVOX)
+        {
+            subLaserCloudLivox = create_subscription<livox_ros_driver2::msg::CustomMsg>(
+                    pointCloudTopic, qos_lidar,
+                    std::bind(&ImageProjection::cloudHandlerLivox, this, std::placeholders::_1),
+                    lidarOpt);
+        }
+        else
+        {
+            subLaserCloud = create_subscription<sensor_msgs::msg::PointCloud2>(
+                    pointCloudTopic, qos_lidar,
+                    std::bind(&ImageProjection::cloudHandler, this, std::placeholders::_1),
+                    lidarOpt);
+        }
 
         pubExtractedCloud = create_publisher<sensor_msgs::msg::PointCloud2>(
             "lio_sam/deskew/cloud_deskewed", 1);
@@ -220,6 +237,62 @@ public:
         publishClouds();
 
         resetParameters();
+    }
+
+    void cloudHandlerLivox(const livox_ros_driver2::msg::CustomMsg::SharedPtr laserCloudMsg)
+    {
+        if (!cachePointCloudLivox(laserCloudMsg))
+            return;
+
+        if (!deskewInfo())
+            return;
+
+        projectPointCloud();
+
+        cloudExtraction();
+
+        publishClouds();
+
+        resetParameters();
+    }
+
+    bool cachePointCloudLivox(const livox_ros_driver2::msg::CustomMsg::SharedPtr& laserCloudMsg)
+    {
+        // cache point cloud
+        cloudQueueLivox.push_back(*laserCloudMsg);
+        if (cloudQueueLivox.size() <= 2)
+            return false;
+
+        // convert cloud
+        currentCloudMsgLivox = std::move(cloudQueueLivox.front());
+        cloudQueueLivox.pop_front();
+
+        // Convert to Velodyne format
+        laserCloudIn->points.resize(currentCloudMsgLivox.point_num);
+        laserCloudIn->is_dense = true;
+        for (size_t i = 0; i < currentCloudMsgLivox.point_num; i++)
+        {
+            auto &dst = laserCloudIn->points[i];
+            dst.x = currentCloudMsgLivox.points[i].x;
+            dst.y = currentCloudMsgLivox.points[i].y;
+            dst.z = currentCloudMsgLivox.points[i].z;
+            dst.intensity = currentCloudMsgLivox.points[i].reflectivity;
+            dst.ring = currentCloudMsgLivox.points[i].line;
+            dst.time = currentCloudMsgLivox.points[i].offset_time * 1e-9f;
+        }
+
+        // get timestamp
+        cloudHeader = currentCloudMsgLivox.header;
+        timeScanCur = stamp2Sec(cloudHeader.stamp);
+        timeScanEnd = timeScanCur + laserCloudIn->points.back().time;
+
+        // remove Nan
+        vector<int> indices;
+        pcl::removeNaNFromPointCloud(*laserCloudIn, *laserCloudIn, indices);
+
+        ringFlag = 1;
+        deskewFlag = 1;
+        return true;
     }
 
     bool cachePointCloud(const sensor_msgs::msg::PointCloud2::SharedPtr& laserCloudMsg)
